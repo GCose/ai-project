@@ -1,14 +1,19 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Head from "next/head";
-import {
-  Loader2,
-  CheckCircle2,
-  AlertTriangle,
-  XCircle,
-  Sun,
-  Moon,
-} from "lucide-react";
 import Image from "next/image";
+import {
+  AlertTriangle,
+  ArrowLeft,
+  Camera,
+  Check,
+  CheckCircle2,
+  Image as ImageIcon,
+  Loader2,
+  Moon,
+  RotateCcw,
+  Sun,
+  XCircle,
+} from "lucide-react";
 
 interface PredictionResult {
   disease: string;
@@ -23,14 +28,22 @@ const CLASS_NAMES = [
   "Tomato___healthy",
 ];
 
-// Below this confidence the app says it is not sure instead of guessing
+// A disease is only reported at or above this confidence
 const CONFIDENCE_THRESHOLD = 70;
+
+// Shown when the model finds none of the diseases it knows
+const NO_ISSUES = "No_issues";
 
 let modelPromise: Promise<import("@tensorflow/tfjs").GraphModel> | null = null;
 
 const loadModel = async () => {
   const tf = await import("@tensorflow/tfjs");
-  if (!modelPromise) modelPromise = tf.loadGraphModel("/model/model.json");
+  if (!modelPromise) {
+    modelPromise = tf.loadGraphModel("/model/model.json").catch((err) => {
+      modelPromise = null;
+      throw err;
+    });
+  }
   return { tf, model: await modelPromise };
 };
 
@@ -45,17 +58,22 @@ const predictInBrowser = async (src: string): Promise<PredictionResult> => {
       .resizeBilinear(tf.browser.fromPixels(img), [224, 224])
       .div(255)
       .expandDims(0);
-    return (model.predict(input) as import("@tensorflow/tfjs").Tensor).dataSync();
+    return (
+      model.predict(input) as import("@tensorflow/tfjs").Tensor
+    ).dataSync();
   });
 
   let best = 0;
   for (let i = 1; i < probs.length; i++) if (probs[i] > probs[best]) best = i;
   const confidence = Math.round(probs[best] * 1000) / 10;
 
-  return {
-    disease: confidence < CONFIDENCE_THRESHOLD ? "Uncertain" : CLASS_NAMES[best],
-    confidence,
-  };
+  const predicted = CLASS_NAMES[best];
+  const isHealthy = predicted.endsWith("___healthy");
+
+  if (!isHealthy && confidence < CONFIDENCE_THRESHOLD) {
+    return { disease: NO_ISSUES, confidence };
+  }
+  return { disease: predicted, confidence };
 };
 
 const diseaseInfo: Record<
@@ -66,14 +84,14 @@ const diseaseInfo: Record<
     recommendations: string[][];
   }
 > = {
-  Uncertain: {
-    status: "Not Sure",
-    statusType: "warning",
+  [NO_ISSUES]: {
+    status: "No issues detected",
+    statusType: "healthy",
     recommendations: [
       [
-        "CropDoc could not identify this with enough confidence",
-        "Take a clearer photo of a single leaf in good light",
-        "Contact your nearest agricultural extension officer",
+        "Keep caring for the plant as you are",
+        "Check the leaves again in a few days",
+        "If the plant still looks sick, contact your extension officer",
       ],
     ],
   },
@@ -201,7 +219,7 @@ const diseaseInfo: Record<
     ],
   },
   Potato___healthy: {
-    status: "Healthy Plant",
+    status: "No issues detected",
     statusType: "healthy",
     recommendations: [
       [
@@ -242,7 +260,7 @@ const diseaseInfo: Record<
     ],
   },
   Tomato___healthy: {
-    status: "Healthy Plant",
+    status: "No issues detected",
     statusType: "healthy",
     recommendations: [
       [
@@ -284,21 +302,85 @@ const diseaseInfo: Record<
   },
 };
 
+const statusColor = {
+  healthy: "var(--leaf)",
+  warning: "var(--rust)",
+  danger: "var(--blight)",
+};
+
+const splitLabel = (disease: string) => {
+  if (disease === NO_ISSUES) return null;
+  const [crop, condition] = disease.split("___");
+  return { crop, condition: condition.replace(/_/g, " ").toLowerCase() };
+};
+
+function ConfidenceRing({ value, color }: { value: number; color: string }) {
+  const r = 26;
+  const c = 2 * Math.PI * r;
+  return (
+    <div
+      className="relative w-16 h-16 shrink-0"
+      aria-label={`${value}% confidence`}
+    >
+      <svg viewBox="0 0 64 64" className="w-16 h-16 -rotate-90">
+        <circle
+          cx="32"
+          cy="32"
+          r={r}
+          fill="none"
+          stroke="var(--line)"
+          strokeWidth="6"
+        />
+        <circle
+          cx="32"
+          cy="32"
+          r={r}
+          fill="none"
+          stroke={color}
+          strokeWidth="6"
+          strokeLinecap="round"
+          strokeDasharray={c}
+          strokeDashoffset={c - (c * value) / 100}
+          className="ring-fill"
+        />
+      </svg>
+      <span className="absolute inset-0 flex items-center justify-center font-display text-sm font-semibold">
+        {Math.floor(value)}%
+      </span>
+    </div>
+  );
+}
+
 export default function Home() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [previewUrl, setPreviewUrl] = useState<string>("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState<PredictionResult | null>(null);
   const [dark, setDark] = useState(false);
+  const [dragging, setDragging] = useState(false);
   const [recommendationSet, setRecommendationSet] = useState<string[]>([]);
 
+  // Start downloading the model early so the first check is fast
+  useEffect(() => {
+    loadModel().catch(() => {});
+  }, []);
+
+  const selectFile = (file: File | undefined) => {
+    if (!file || !file.type.startsWith("image/")) return;
+    setSelectedFile(file);
+    setPreviewUrl(URL.createObjectURL(file));
+    setResult(null);
+  };
+
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      setSelectedFile(file);
-      setPreviewUrl(URL.createObjectURL(file));
-      setResult(null);
-    }
+    selectFile(e.target.files?.[0]);
+    e.target.value = "";
+  };
+
+  const handleDrop = (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragging(false);
+    if (!loading) selectFile(e.dataTransfer.files?.[0]);
   };
 
   const analyzeImage = async () => {
@@ -309,7 +391,7 @@ export default function Home() {
       setResult(data);
       setRecommendationSet(diseaseInfo[data.disease].recommendations[0]);
     } catch (error) {
-      alert("Error: Could not analyze this image. Please try again.");
+      alert("CropDoc could not read this photo. Try another photo of the leaf.");
       console.error(error);
     } finally {
       setLoading(false);
@@ -323,285 +405,291 @@ export default function Home() {
     setRecommendationSet([]);
   };
 
-  const formatDiseaseName = (disease: string) =>
-    disease.replace(/_/g, " ").replace("___", " - ");
-
   const info = result ? diseaseInfo[result.disease] : null;
+  const label = result ? splitLabel(result.disease) : null;
+  const color = info ? statusColor[info.statusType] : "var(--leaf)";
+  const isDisease = info ? info.statusType !== "healthy" : false;
 
-  const t = {
-    bg: dark ? "bg-[#0d1210]" : "bg-white",
-    text: dark ? "text-slate-100" : "text-slate-900",
-    muted: dark ? "text-slate-400" : "text-slate-500",
-    border: dark ? "border-emerald-700" : "border-emerald-600",
-    headerBg: dark ? "bg-[#0d1210]" : "bg-white",
-    uploadBg: dark ? "bg-[#111a15]" : "bg-white",
-    uploadHover: dark
-      ? "hover:bg-emerald-950/40"
-      : "group-hover:bg-emerald-50/40",
-    uploadIcon: dark ? "bg-[#1a2a20]" : "bg-slate-100",
-    card: dark ? "bg-[#111a15]" : "bg-white",
-    btnReset: dark
-      ? "bg-[#1a2420] border-[#2a3a30] text-slate-300 hover:bg-[#1f2e26]"
-      : "bg-white border-slate-200 text-slate-700 hover:bg-slate-50",
-    toggleBg: dark
-      ? "bg-emerald-900/50 text-emerald-300 hover:bg-emerald-900"
-      : "bg-emerald-50 text-emerald-700 hover:bg-emerald-100",
-    confBg: dark ? "bg-slate-700" : "bg-slate-200",
-  };
+  const fileInput = (useCamera: boolean) => (
+    <input
+      type="file"
+      accept="image/*"
+      capture={useCamera ? "environment" : undefined}
+      className="sr-only"
+      onChange={handleFileSelect}
+    />
+  );
+
+  const heading = !previewUrl
+    ? "Check a leaf"
+    : loading
+      ? "Checking the leaf"
+      : "Ready to check";
+
+  const intro = !previewUrl
+    ? "Use a clear photo of one sick leaf in daylight. CropDoc tells you what is wrong and what to do."
+    : loading
+      ? "Looking for signs of disease. This takes a few seconds."
+      : "Make sure the leaf fills most of the frame, then check it.";
 
   return (
     <>
       <Head>
         <title>CropDoc</title>
+        <meta
+          name="viewport"
+          content="width=device-width, initial-scale=1, viewport-fit=cover"
+        />
+        <meta name="theme-color" content={dark ? "#0B2219" : "#EAF2EC"} />
         <link rel="shortcut icon" href="/logo.png" type="image/x-icon" />
       </Head>
 
-      <div
-        className={`min-h-screen relative overflow-hidden ${t.bg} transition-colors duration-300`}
-      >
-        <div
-          aria-hidden
-          className="pointer-events-none absolute -top-30 -right-30 w-180 h-180 rounded-full"
-          style={{
-            background: dark
-              ? "radial-gradient(circle at 60% 40%, rgba(52,211,153,0.18) 0%, rgba(16,185,129,0.08) 40%, transparent 70%)"
-              : "radial-gradient(circle at 60% 40%, rgba(52,211,153,0.22) 0%, rgba(16,185,129,0.10) 40%, transparent 70%)",
-            filter: "blur(8px)",
-          }}
-        />
-
-        <div className="relative max-w-7xl mx-auto px-4">
-          <header className="py-10">
-            <div
-              className={`flex items-center justify-between border-b ${t.border} pb-4`}
+      <div data-theme={dark ? "dark" : "light"} className="app-shell">
+        <header className="app-header">
+          {previewUrl && (
+            <button
+              onClick={reset}
+              aria-label="Start over"
+              className="icon-btn lg:hidden"
             >
-              <div className="flex items-center gap-3">
-                <Image
-                  width={40}
-                  height={40}
-                  src="/logo.png"
-                  alt="CropDoc Logo"
-                />
-                <h1 className={`text-xl font-semibold ${t.text}`}>CropDoc</h1>
-              </div>
+              <ArrowLeft className="w-5 h-5" />
+            </button>
+          )}
+          <div
+            className={`items-center gap-2.5 ${previewUrl ? "hidden lg:flex" : "flex"}`}
+          >
+            <Image
+              src="/logo.png"
+              alt=""
+              width={32}
+              height={32}
+              className="rounded-lg lg:w-9 lg:h-9"
+              priority
+            />
+            <span className="font-display text-xl lg:text-2xl font-semibold tracking-tight">
+              CropDoc
+            </span>
+          </div>
+          <button
+            aria-label={dark ? "Switch to light mode" : "Switch to dark mode"}
+            onClick={() => setDark(!dark)}
+            className="icon-btn"
+          >
+            {dark ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
+          </button>
+        </header>
 
-              <button
-                aria-label="Toggle dark mode"
-                onClick={() => setDark(!dark)}
-                className={`cursor-pointer p-2 rounded-lg transition-colors ${t.toggleBg}`}
-              >
-                {dark ? (
-                  <Sun className="w-4 h-4" />
+        <main className="app-main">
+          <section
+            className={`visual ${result ? "visual--result" : ""}`}
+            onDragOver={(e) => {
+              e.preventDefault();
+              setDragging(true);
+            }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={handleDrop}
+          >
+            <div
+              className={`leaf-frame ${result ? "leaf-frame--still" : ""}`}
+              data-busy={loading}
+              data-dragging={dragging}
+            >
+              <div className="leaf-inner">
+                {previewUrl ? (
+                  <Image
+                    src={previewUrl}
+                    alt="Your leaf photo"
+                    fill
+                    unoptimized
+                    className="object-cover"
+                  />
                 ) : (
-                  <Moon className="w-4 h-4" />
+                  <label className="w-full h-full flex flex-col items-center justify-center gap-3 cursor-pointer px-8 text-center">
+                    {fileInput(false)}
+                    <span className="leaf-badge">
+                      <Camera className="w-7 h-7" />
+                    </span>
+                    <span className="text-sm text-[var(--muted)] lg:hidden">
+                      No photo yet
+                    </span>
+                    <span className="hidden lg:block text-[15px] text-[var(--muted)]">
+                      Drop a leaf photo here
+                    </span>
+                  </label>
                 )}
-              </button>
+                {!result && (
+                  <>
+                    <span className="bracket tl" />
+                    <span className="bracket tr" />
+                    <span className="bracket bl" />
+                    <span className="bracket br" />
+                  </>
+                )}
+                {loading && <span className="scan-line" />}
+              </div>
             </div>
-          </header>
+          </section>
 
-          <main className="pb-16">
-            <div className="grid lg:grid-cols-2 gap-8">
-              <div>
-                <div className="sticky top-8">
+          <section className={`panel ${result ? "" : "panel--intro"}`}>
+            {!result ? (
+              <>
+                <h1 className="font-display text-[2.5rem] lg:text-[4rem] leading-[1.02] font-semibold tracking-tight">
+                  {heading}
+                </h1>
+                <p className="mt-2 lg:mt-4 text-[15px] lg:text-lg leading-relaxed text-[var(--muted)] max-w-[40ch]">
+                  {intro}
+                </p>
+
+                {!previewUrl && (
+                  <div className="mt-4 lg:mt-6 flex items-center gap-2 text-sm text-[var(--muted)]">
+                    <span>Works with</span>
+                    <span className="chip">Potato</span>
+                    <span className="chip">Tomato</span>
+                  </div>
+                )}
+
+                <div className="hidden lg:flex gap-3 mt-10">
                   {!previewUrl ? (
-                    <label className="block cursor-pointer group">
-                      <input
-                        type="file"
-                        accept="image/*"
-                        className="hidden"
-                        onChange={handleFileSelect}
-                      />
-                      <div
-                        className={`relative aspect-square border-dashed border ${t.border} rounded-2xl flex flex-col items-center justify-center transition-all ${t.uploadHover} ${t.uploadBg}`}
-                      >
-                        <div
-                          className={`w-16 h-16 ${t.uploadIcon} rounded-2xl flex items-center justify-center mb-6 group-hover:bg-emerald-50 transition-colors`}
-                        >
-                          <svg
-                            className="w-8 h-8 text-slate-400 group-hover:text-emerald-600 transition-colors"
-                            fill="none"
-                            stroke="currentColor"
-                            viewBox="0 0 24 24"
-                          >
-                            <path
-                              strokeLinecap="round"
-                              strokeLinejoin="round"
-                              strokeWidth={1.5}
-                              d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z"
-                            />
-                          </svg>
-                        </div>
-
-                        <h2 className={`text-lg font-medium ${t.text} mb-2`}>
-                          Upload crop image
-                        </h2>
-
-                        <p className={`text-sm ${t.muted}`}>
-                          Click to select or drag and drop
-                        </p>
-                      </div>
+                    <label className="btn-primary btn-wide">
+                      {fileInput(false)}
+                      <ImageIcon className="w-5 h-5" />
+                      Choose a photo
                     </label>
                   ) : (
                     <>
-                      <div className="relative aspect-square bg-transparent rounded-2xl overflow-hidden">
-                        <Image
-                          fill
-                          alt="Preview"
-                          src={previewUrl}
-                          style={{ objectFit: "cover" }}
-                        />
-                      </div>
-                      <button
-                        onClick={reset}
-                        className={`cursor-pointer mt-4 w-full py-3 px-4 text-sm font-medium border rounded-xl transition-colors ${t.btnReset}`}
-                      >
-                        Upload different image
-                      </button>
-                    </>
-                  )}
-                </div>
-              </div>
-
-              <div>
-                {!previewUrl ? (
-                  <div
-                    className={`border-l ${t.border} p-8 h-full flex flex-col items-center justify-center text-center`}
-                  >
-                    <h3 className={`text-base font-medium ${t.text} mb-2`}>
-                      No image selected
-                    </h3>
-                    <p className={`text-sm ${t.muted} max-w-xs`}>
-                      Upload a crop image to analyze it for diseases
-                    </p>
-                  </div>
-                ) : !result ? (
-                  <div className={`border-l ${t.border} space-y-4`}>
-                    <div className="rounded-2xl p-8">
-                      <h3 className={`text-sm font-medium ${t.muted} mb-2`}>
-                        Ready to analyze
-                      </h3>
-                      <p className={`${t.text} mb-6`}>
-                        Click the button below to detect diseases in your crop
-                        image
-                      </p>
                       <button
                         disabled={loading}
                         onClick={analyzeImage}
-                        className="cursor-pointer w-full py-4 px-6 text-base font-medium text-white bg-emerald-600 rounded-xl hover:bg-emerald-700 transition-colors disabled:opacity-50 flex items-center justify-center gap-2"
+                        className="btn-primary btn-wide"
                       >
                         {loading ? (
                           <>
                             <Loader2 className="w-5 h-5 animate-spin" />
-                            Analyzing...
+                            Checking
                           </>
                         ) : (
-                          "Analyze Image"
+                          "Check this leaf"
                         )}
                       </button>
-                    </div>
+                      <button
+                        disabled={loading}
+                        onClick={reset}
+                        className="btn-secondary btn-wide"
+                      >
+                        <RotateCcw className="w-5 h-5" />
+                        Use another photo
+                      </button>
+                    </>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="result-sheet">
+                <div className="flex items-start gap-4">
+                  <span className="status-badge" style={{ background: color }}>
+                    {info?.statusType === "healthy" ? (
+                      <CheckCircle2 className="w-6 h-6" />
+                    ) : info?.statusType === "warning" ? (
+                      <AlertTriangle className="w-6 h-6" />
+                    ) : (
+                      <XCircle className="w-6 h-6" />
+                    )}
+                  </span>
+                  <div className="flex-1 min-w-0">
+                    <h1 className="font-display text-[1.75rem] lg:text-[2.5rem] leading-tight font-semibold tracking-tight">
+                      {info?.status}
+                    </h1>
+                    {label && (
+                      <p className="text-sm lg:text-base text-[var(--muted)] mt-0.5">
+                        {isDisease
+                          ? `${label.crop}, ${label.condition}`
+                          : `${label.crop} leaf`}
+                      </p>
+                    )}
                   </div>
-                ) : (
-                  <div className={`border-l ${t.border} pl-4 space-y-12`}>
-                    <div>
-                      <h3
-                        className={`text-base font-semibold ${t.muted} uppercase tracking-wider mb-4`}
-                      >
-                        Detection Result
-                      </h3>
-                      <div
-                        className={`p-6 ${
-                          info?.statusType === "healthy"
-                            ? "border-b border-emerald-500"
-                            : info?.statusType === "warning"
-                              ? "border-b border-amber-500"
-                              : "border-b border-rose-500"
-                        }`}
-                      >
-                        <div className="flex items-start gap-4">
-                          {info?.statusType === "healthy" ? (
-                            <div className="w-12 h-12 bg-emerald-100 rounded-full flex items-center justify-center shrink-0">
-                              <CheckCircle2 className="w-6 h-6 text-emerald-600" />
-                            </div>
-                          ) : info?.statusType === "warning" ? (
-                            <div className="w-12 h-12 bg-amber-100 rounded-full flex items-center justify-center shrink-0">
-                              <AlertTriangle className="w-6 h-6 text-amber-600" />
-                            </div>
-                          ) : (
-                            <div className="w-12 h-12 bg-rose-100 rounded-full flex items-center justify-center shrink-0">
-                              <XCircle className="w-6 h-6 text-rose-600" />
-                            </div>
-                          )}
-                          <div className="flex-1 min-w-0">
-                            <p
-                              className={`text-lg font-semibold mb-1 ${
-                                info?.statusType === "healthy"
-                                  ? "text-emerald-600"
-                                  : info?.statusType === "warning"
-                                    ? "text-amber-500"
-                                    : "text-rose-500"
-                              }`}
-                            >
-                              {info?.status}
-                            </p>
-                            <p className={`text-sm ${t.muted}`}>
-                              {formatDiseaseName(result.disease)}
-                            </p>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
+                  {isDisease && (
+                    <ConfidenceRing value={result.confidence} color={color} />
+                  )}
+                </div>
 
-                    <div>
-                      <h3
-                        className={`text-base font-semibold ${t.muted} uppercase tracking-wider mb-4`}
+                <h2 className="font-display text-lg lg:text-xl font-semibold mt-7 lg:mt-10 mb-3 lg:mb-4">
+                  What to do
+                </h2>
+                <ul className="space-y-3">
+                  {recommendationSet.map((rec, i) => (
+                    <li key={i} className="flex items-start gap-3">
+                      <span
+                        className="mt-0.5 w-5 h-5 rounded-full flex items-center justify-center shrink-0"
+                        style={{
+                          background: `color-mix(in srgb, ${color} 16%, transparent)`,
+                          color,
+                        }}
                       >
-                        Confidence Score
-                      </h3>
-                      <div className={`border-b ${t.border} p-6`}>
-                        <div className="flex items-center justify-between mb-3">
-                          <span className={`text-base ${t.muted}`}>
-                            Model confidence
-                          </span>
-                          <span className={`text-3xl font-bold ${t.text}`}>
-                            {result.confidence}%
-                          </span>
-                        </div>
-                        <div className={`w-full ${t.confBg} rounded-full h-2`}>
-                          <div
-                            className="bg-emerald-600 h-2 rounded-full transition-all duration-1000"
-                            style={{ width: `${result.confidence}%` }}
-                          />
-                        </div>
-                      </div>
-                    </div>
+                        <Check className="w-3 h-3" strokeWidth={3} />
+                      </span>
+                      <span className="text-[15px] lg:text-base leading-relaxed">
+                        {rec}
+                      </span>
+                    </li>
+                  ))}
+                </ul>
 
-                    <div>
-                      <h3
-                        className={`text-base font-semibold ${t.muted} uppercase tracking-wider mb-4`}
-                      >
-                        Recommendations
-                      </h3>
-                      <div className={`border-b ${t.border} p-6`}>
-                        <ul className="space-y-2">
-                          {recommendationSet.map((rec, i) => (
-                            <li key={i} className="flex items-start gap-2">
-                              <span className="text-emerald-500 mt-0.5">✓</span>
-                              <span
-                                className={`text-base ${t.text} leading-relaxed`}
-                              >
-                                {rec}
-                              </span>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    </div>
-                  </div>
-                )}
+                <label className="hidden lg:flex btn-primary btn-wide w-fit mt-10">
+                  {fileInput(false)}
+                  <ImageIcon className="w-5 h-5" />
+                  Check another leaf
+                </label>
               </div>
-            </div>
-          </main>
-        </div>
+            )}
+          </section>
+        </main>
+
+        <footer className="action-bar lg:hidden">
+          {!previewUrl ? (
+            <>
+              <label className="btn-primary flex-1">
+                {fileInput(true)}
+                <Camera className="w-5 h-5" />
+                Take a photo
+              </label>
+              <label className="btn-secondary" aria-label="Choose from gallery">
+                {fileInput(false)}
+                <ImageIcon className="w-5 h-5" />
+              </label>
+            </>
+          ) : !result ? (
+            <>
+              <button
+                disabled={loading}
+                onClick={analyzeImage}
+                className="btn-primary flex-1"
+              >
+                {loading ? (
+                  <>
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                    Checking
+                  </>
+                ) : (
+                  "Check this leaf"
+                )}
+              </button>
+              <button
+                disabled={loading}
+                onClick={reset}
+                aria-label="Retake photo"
+                className="btn-secondary"
+              >
+                <RotateCcw className="w-5 h-5" />
+              </button>
+            </>
+          ) : (
+            <label className="btn-primary flex-1">
+              {fileInput(true)}
+              <Camera className="w-5 h-5" />
+              Check another leaf
+            </label>
+          )}
+        </footer>
       </div>
     </>
   );
