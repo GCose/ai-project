@@ -24,3 +24,19 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+::-webkit-scrollbar {
+  width: 0.5rem;
+  background: #ffffff;
+}
+
+::selection {
+  color: #ffffff;
+  background: #1da477;
+}
+
+::-webkit-scrollbar-thumb {
+  width: 0.5rem;
+  border-radius: 100rem;
+  background: #1da477;
+}
