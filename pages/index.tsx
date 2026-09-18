@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import Head from "next/head";
 import Image from "next/image";
+import type { GraphModel, Tensor, Tensor2D } from "@tensorflow/tfjs";
 import {
   AlertTriangle,
   ArrowLeft,
@@ -8,6 +9,7 @@ import {
   Check,
   CheckCircle2,
   Image as ImageIcon,
+  ImageOff,
   Loader2,
   Moon,
   RotateCcw,
@@ -31,37 +33,80 @@ const CLASS_NAMES = [
 // A disease is only reported at or above this confidence
 const CONFIDENCE_THRESHOLD = 70;
 
+// Two checks run before any diagnosis is shown. They never change the
+// disease scores; they only decide whether to show them.
+//
+// 1. Does the photo resemble the leaves the model was trained on?
+//    Rejects non-leaf photos (landscapes, screenshots, noise, flat colours).
+const LEAF_SIMILARITY_THRESHOLD = 0.6;
+// 2. Is it one of the 5 conditions the model knows? A small check trained on
+//    33 other PlantVillage classes (maize, pepper, other tomato diseases...).
+const KNOWN_THRESHOLD = 0.5;
+
 // Shown when the model finds none of the diseases it knows
 const NO_ISSUES = "No_issues";
 
-let modelPromise: Promise<import("@tensorflow/tfjs").GraphModel> | null = null;
+// Shown when the photo is not something the model was trained to recognise
+const UNKNOWN = "Unknown";
+
+// Graph node names for the model outputs: leaf features, disease scores and
+// the known-condition score
+const FEATURES_NODE = "Identity";
+const SCORES_NODE = "Identity_1";
+const KNOWN_NODE = "Identity_2";
+
+let modelPromise: Promise<{ model: GraphModel; centroids: Tensor2D }> | null =
+  null;
 
 const loadModel = async () => {
   const tf = await import("@tensorflow/tfjs");
   if (!modelPromise) {
-    modelPromise = tf.loadGraphModel("/model/model.json").catch((err) => {
-      modelPromise = null;
-      throw err;
-    });
+    modelPromise = Promise.all([
+      tf.loadGraphModel("/model/model.json"),
+      fetch("/model/centroids.json").then((res) => res.json()),
+    ])
+      .then(([model, data]) => ({
+        model,
+        centroids: tf.tensor2d(data.centroids),
+      }))
+      .catch((err) => {
+        modelPromise = null;
+        throw err;
+      });
   }
-  return { tf, model: await modelPromise };
+  return { tf, ...(await modelPromise) };
 };
 
 const predictInBrowser = async (src: string): Promise<PredictionResult> => {
-  const { tf, model } = await loadModel();
+  const { tf, model, centroids } = await loadModel();
   const img = new window.Image();
   img.src = src;
   await img.decode();
 
-  const probs = tf.tidy(() => {
+  const [simTensor, scoreTensor, knownTensor] = tf.tidy(() => {
     const input = tf.image
       .resizeBilinear(tf.browser.fromPixels(img), [224, 224])
       .div(255)
       .expandDims(0);
-    return (
-      model.predict(input) as import("@tensorflow/tfjs").Tensor
-    ).dataSync();
+    const [features, scores, known] = model.execute(input, [
+      FEATURES_NODE,
+      SCORES_NODE,
+      KNOWN_NODE,
+    ]) as Tensor[];
+    const unit = features.div(features.norm());
+    return [tf.matMul(unit, centroids, false, true).max(), scores, known];
   });
+  const similarity = simTensor.dataSync()[0];
+  const probs = scoreTensor.dataSync();
+  const knownScore = knownTensor.dataSync()[0];
+  tf.dispose([simTensor, scoreTensor, knownTensor]);
+
+  if (
+    similarity < LEAF_SIMILARITY_THRESHOLD ||
+    knownScore < KNOWN_THRESHOLD
+  ) {
+    return { disease: UNKNOWN, confidence: 0 };
+  }
 
   let best = 0;
   for (let i = 1; i < probs.length; i++) if (probs[i] > probs[best]) best = i;
@@ -80,10 +125,21 @@ const diseaseInfo: Record<
   string,
   {
     status: string;
-    statusType: "healthy" | "warning" | "danger";
+    statusType: "healthy" | "warning" | "danger" | "unknown";
     recommendations: string[][];
   }
 > = {
+  [UNKNOWN]: {
+    status: "Can't identify this",
+    statusType: "unknown",
+    recommendations: [
+      [
+        "CropDoc knows potato and tomato leaves, and 3 of their diseases",
+        "Take a close photo of one leaf in daylight, filling the frame",
+        "If the plant looks sick, contact your extension officer",
+      ],
+    ],
+  },
   [NO_ISSUES]: {
     status: "No issues detected",
     statusType: "healthy",
@@ -96,7 +152,7 @@ const diseaseInfo: Record<
     ],
   },
   Potato___Early_blight: {
-    status: "Early Blight Detected",
+    status: "Early blight detected",
     statusType: "warning",
     recommendations: [
       [
@@ -137,7 +193,7 @@ const diseaseInfo: Record<
     ],
   },
   Potato___Late_blight: {
-    status: "Late Blight Detected",
+    status: "Late blight detected",
     statusType: "danger",
     recommendations: [
       [
@@ -178,7 +234,7 @@ const diseaseInfo: Record<
     ],
   },
   Tomato___Late_blight: {
-    status: "Late Blight Detected",
+    status: "Late blight detected",
     statusType: "danger",
     recommendations: [
       [
@@ -303,13 +359,14 @@ const diseaseInfo: Record<
 };
 
 const statusColor = {
+  unknown: "var(--muted)",
   healthy: "var(--leaf)",
   warning: "var(--rust)",
   danger: "var(--blight)",
 };
 
 const splitLabel = (disease: string) => {
-  if (disease === NO_ISSUES) return null;
+  if (disease === NO_ISSUES || disease === UNKNOWN) return null;
   const [crop, condition] = disease.split("___");
   return { crop, condition: condition.replace(/_/g, " ").toLowerCase() };
 };
@@ -360,7 +417,7 @@ export default function Home() {
   const [dragging, setDragging] = useState(false);
   const [recommendationSet, setRecommendationSet] = useState<string[]>([]);
 
-  // Start downloading the model early so the first check is fast
+  // Start downloading the model early so the first analysis is fast
   useEffect(() => {
     loadModel().catch(() => {});
   }, []);
@@ -408,7 +465,9 @@ export default function Home() {
   const info = result ? diseaseInfo[result.disease] : null;
   const label = result ? splitLabel(result.disease) : null;
   const color = info ? statusColor[info.statusType] : "var(--leaf)";
-  const isDisease = info ? info.statusType !== "healthy" : false;
+  const isDisease = info
+    ? info.statusType === "warning" || info.statusType === "danger"
+    : false;
 
   const fileInput = (useCamera: boolean) => (
     <input
@@ -421,16 +480,16 @@ export default function Home() {
   );
 
   const heading = !previewUrl
-    ? "Check a leaf"
+    ? "Analyze a leaf"
     : loading
-      ? "Checking the leaf"
-      : "Ready to check";
+      ? "Analyzing the leaf"
+      : "Ready to analyze";
 
   const intro = !previewUrl
     ? "Use a clear photo of one sick leaf in daylight. CropDoc tells you what is wrong and what to do."
     : loading
-      ? "Looking for signs of disease. This takes a few seconds."
-      : "Make sure the leaf fills most of the frame, then check it.";
+      ? "Reading the leaf for signs of disease. This takes a few seconds."
+      : "Make sure the leaf fills most of the frame, then analyze it.";
 
   return (
     <>
@@ -490,11 +549,11 @@ export default function Home() {
             onDrop={handleDrop}
           >
             <div
-              className={`leaf-frame ${result ? "leaf-frame--still" : ""}`}
+              className="scanner"
               data-busy={loading}
               data-dragging={dragging}
             >
-              <div className="leaf-inner">
+              <div className="scanner-inner">
                 {previewUrl ? (
                   <Image
                     src={previewUrl}
@@ -506,7 +565,7 @@ export default function Home() {
                 ) : (
                   <label className="w-full h-full flex flex-col items-center justify-center gap-3 cursor-pointer px-8 text-center">
                     {fileInput(false)}
-                    <span className="leaf-badge">
+                    <span className="scan-badge">
                       <Camera className="w-7 h-7" />
                     </span>
                     <span className="text-sm text-[var(--muted)] lg:hidden">
@@ -565,10 +624,10 @@ export default function Home() {
                         {loading ? (
                           <>
                             <Loader2 className="w-5 h-5 animate-spin" />
-                            Checking
+                            Analyzing
                           </>
                         ) : (
-                          "Check this leaf"
+                          "Analyze leaf"
                         )}
                       </button>
                       <button
@@ -587,7 +646,9 @@ export default function Home() {
               <div className="result-sheet">
                 <div className="flex items-start gap-4">
                   <span className="status-badge" style={{ background: color }}>
-                    {info?.statusType === "healthy" ? (
+                    {info?.statusType === "unknown" ? (
+                      <ImageOff className="w-6 h-6" />
+                    ) : info?.statusType === "healthy" ? (
                       <CheckCircle2 className="w-6 h-6" />
                     ) : info?.statusType === "warning" ? (
                       <AlertTriangle className="w-6 h-6" />
@@ -596,7 +657,7 @@ export default function Home() {
                     )}
                   </span>
                   <div className="flex-1 min-w-0">
-                    <h1 className="font-display text-[1.75rem] lg:text-[2.5rem] leading-tight font-semibold tracking-tight">
+                    <h1 className="font-display text-[1.75rem] lg:text-[2.25rem] leading-tight font-semibold tracking-tight">
                       {info?.status}
                     </h1>
                     {label && (
@@ -612,8 +673,8 @@ export default function Home() {
                   )}
                 </div>
 
-                <h2 className="font-display text-lg lg:text-xl font-semibold mt-7 lg:mt-10 mb-3 lg:mb-4">
-                  What to do
+                <h2 className="font-display text-lg lg:text-xl font-semibold mt-7 lg:mt-8 mb-3 lg:mb-4">
+                  {info?.statusType === "unknown" ? "Try this" : "What to do"}
                 </h2>
                 <ul className="space-y-3">
                   {recommendationSet.map((rec, i) => (
@@ -637,7 +698,7 @@ export default function Home() {
                 <label className="hidden lg:flex btn-primary btn-wide w-fit mt-10">
                   {fileInput(false)}
                   <ImageIcon className="w-5 h-5" />
-                  Check another leaf
+                  Analyze another leaf
                 </label>
               </div>
             )}
@@ -667,16 +728,16 @@ export default function Home() {
                 {loading ? (
                   <>
                     <Loader2 className="w-5 h-5 animate-spin" />
-                    Checking
+                    Analyzing
                   </>
                 ) : (
-                  "Check this leaf"
+                  "Analyze leaf"
                 )}
               </button>
               <button
                 disabled={loading}
                 onClick={reset}
-                aria-label="Retake photo"
+                aria-label="Use another photo"
                 className="btn-secondary"
               >
                 <RotateCcw className="w-5 h-5" />
@@ -686,7 +747,7 @@ export default function Home() {
             <label className="btn-primary flex-1">
               {fileInput(true)}
               <Camera className="w-5 h-5" />
-              Check another leaf
+              Analyze another leaf
             </label>
           )}
         </footer>
