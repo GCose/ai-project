@@ -55,14 +55,22 @@ const FEATURES_NODE = "Identity";
 const SCORES_NODE = "Identity_1";
 const KNOWN_NODE = "Identity_2";
 
+// The analyzing state stays on screen at least this long, so it never flashes
+const MIN_ANALYZE_MS = 1200;
+
 let modelPromise: Promise<{ model: GraphModel; centroids: Tensor2D }> | null =
   null;
+
+// Reports model download progress (0 to 1) to whoever is listening
+let reportProgress: (fraction: number) => void = () => {};
 
 const loadModel = async () => {
   const tf = await import("@tensorflow/tfjs");
   if (!modelPromise) {
     modelPromise = Promise.all([
-      tf.loadGraphModel("/model/model.json"),
+      tf.loadGraphModel("/model/model.json", {
+        onProgress: (fraction) => reportProgress(fraction),
+      }),
       fetch("/model/centroids.json").then((res) => res.json()),
     ])
       .then(([model, data]) => ({
@@ -101,10 +109,7 @@ const predictInBrowser = async (src: string): Promise<PredictionResult> => {
   const knownScore = knownTensor.dataSync()[0];
   tf.dispose([simTensor, scoreTensor, knownTensor]);
 
-  if (
-    similarity < LEAF_SIMILARITY_THRESHOLD ||
-    knownScore < KNOWN_THRESHOLD
-  ) {
+  if (similarity < LEAF_SIMILARITY_THRESHOLD || knownScore < KNOWN_THRESHOLD) {
     return { disease: UNKNOWN, confidence: 0 };
   }
 
@@ -417,16 +422,29 @@ export default function Home() {
   const [dragging, setDragging] = useState(false);
   const [recommendationSet, setRecommendationSet] = useState<string[]>([]);
 
+  const [modelReady, setModelReady] = useState(false);
+  const [modelProgress, setModelProgress] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+
   // Start downloading the model early so the first analysis is fast
   useEffect(() => {
-    loadModel().catch(() => {});
+    reportProgress = setModelProgress;
+    loadModel()
+      .then(() => setModelReady(true))
+      .catch(() => {});
   }, []);
 
   const selectFile = (file: File | undefined) => {
-    if (!file || !file.type.startsWith("image/")) return;
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setError("That file is not a photo. Choose a photo of a leaf.");
+      return;
+    }
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
     setSelectedFile(file);
     setPreviewUrl(URL.createObjectURL(file));
     setResult(null);
+    setError(null);
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -441,26 +459,51 @@ export default function Home() {
   };
 
   const analyzeImage = async () => {
-    if (!selectedFile) return;
+    if (!selectedFile || loading) return;
     setLoading(true);
+    setError(null);
+
     try {
-      const data = await predictInBrowser(previewUrl);
+      await loadModel();
+      setModelReady(true);
+    } catch (err) {
+      console.error(err);
+      setError(
+        "CropDoc could not load. Check your internet connection and try again.",
+      );
+      setLoading(false);
+      return;
+    }
+
+    try {
+      const [data] = await Promise.all([
+        predictInBrowser(previewUrl),
+        new Promise((resolve) => setTimeout(resolve, MIN_ANALYZE_MS)),
+      ]);
       setResult(data);
       setRecommendationSet(diseaseInfo[data.disease].recommendations[0]);
-    } catch (error) {
-      alert("CropDoc could not read this photo. Try another photo of the leaf.");
-      console.error(error);
+      window.scrollTo({ top: 0 });
+    } catch (err) {
+      console.error(err);
+      setError("CropDoc could not read this photo. Try another photo.");
     } finally {
       setLoading(false);
     }
   };
 
+  // Back to the "Analyze a leaf" screen
   const reset = () => {
+    if (loading) return;
+    if (previewUrl) URL.revokeObjectURL(previewUrl);
     setSelectedFile(null);
     setPreviewUrl("");
     setResult(null);
     setRecommendationSet([]);
+    setError(null);
+    window.scrollTo({ top: 0 });
   };
+
+  const preparing = loading && !modelReady;
 
   const info = result ? diseaseInfo[result.disease] : null;
   const label = result ? splitLabel(result.disease) : null;
@@ -481,15 +524,25 @@ export default function Home() {
 
   const heading = !previewUrl
     ? "Analyze a leaf"
-    : loading
-      ? "Analyzing the leaf"
-      : "Ready to analyze";
+    : preparing
+      ? "Getting CropDoc ready"
+      : loading
+        ? "Analyzing the leaf"
+        : "Ready to analyze";
 
   const intro = !previewUrl
     ? "Use a clear photo of one sick leaf in daylight. CropDoc tells you what is wrong and what to do."
-    : loading
-      ? "Reading the leaf for signs of disease. This takes a few seconds."
-      : "Make sure the leaf fills most of the frame, then analyze it.";
+    : preparing
+      ? "Loading the AI onto this device. This only happens the first time."
+      : loading
+        ? "Reading the leaf for signs of disease. This takes a few seconds."
+        : "Make sure the leaf fills most of the frame, then analyze it.";
+
+  const loadingLabel = !preparing
+    ? "Analyzing"
+    : modelProgress > 0
+      ? `Getting ready ${Math.round(modelProgress * 100)}%`
+      : "Getting ready";
 
   return (
     <>
@@ -508,6 +561,7 @@ export default function Home() {
           {previewUrl && (
             <button
               onClick={reset}
+              disabled={loading}
               aria-label="Start over"
               className="icon-btn lg:hidden"
             >
@@ -568,10 +622,10 @@ export default function Home() {
                     <span className="scan-badge">
                       <Camera className="w-7 h-7" />
                     </span>
-                    <span className="text-sm text-[var(--muted)] lg:hidden">
+                    <span className="text-sm text-(--muted) lg:hidden">
                       No photo yet
                     </span>
-                    <span className="hidden lg:block text-[15px] text-[var(--muted)]">
+                    <span className="hidden lg:block text-[15px] text-(--muted)">
                       Drop a leaf photo here
                     </span>
                   </label>
@@ -585,6 +639,12 @@ export default function Home() {
                   </>
                 )}
                 {loading && <span className="scan-line" />}
+                {loading && (
+                  <span className="scan-status" role="status">
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                    {loadingLabel}
+                  </span>
+                )}
               </div>
             </div>
           </section>
@@ -595,16 +655,23 @@ export default function Home() {
                 <h1 className="font-display text-[2.5rem] lg:text-[4rem] leading-[1.02] font-semibold tracking-tight">
                   {heading}
                 </h1>
-                <p className="mt-2 lg:mt-4 text-[15px] lg:text-lg leading-relaxed text-[var(--muted)] max-w-[40ch]">
+                <p className="mt-2 lg:mt-4 text-[15px] lg:text-lg leading-relaxed text-(--muted) max-w-[40ch]">
                   {intro}
                 </p>
 
                 {!previewUrl && (
-                  <div className="mt-4 lg:mt-6 flex items-center gap-2 text-sm text-[var(--muted)]">
+                  <div className="mt-4 lg:mt-6 flex items-center gap-2 text-sm text-(--muted)">
                     <span>Works with</span>
                     <span className="chip">Potato</span>
                     <span className="chip">Tomato</span>
                   </div>
+                )}
+
+                {error && (
+                  <p role="alert" className="error-note">
+                    <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
+                    {error}
+                  </p>
                 )}
 
                 <div className="hidden lg:flex gap-3 mt-10">
@@ -624,7 +691,7 @@ export default function Home() {
                         {loading ? (
                           <>
                             <Loader2 className="w-5 h-5 animate-spin" />
-                            Analyzing
+                            {loadingLabel}
                           </>
                         ) : (
                           "Analyze leaf"
@@ -661,7 +728,7 @@ export default function Home() {
                       {info?.status}
                     </h1>
                     {label && (
-                      <p className="text-sm lg:text-base text-[var(--muted)] mt-0.5">
+                      <p className="text-sm lg:text-base text-(--muted) mt-0.5">
                         {isDisease
                           ? `${label.crop}, ${label.condition}`
                           : `${label.crop} leaf`}
@@ -695,11 +762,12 @@ export default function Home() {
                   ))}
                 </ul>
 
-                <label className="hidden lg:flex btn-primary btn-wide w-fit mt-10">
-                  {fileInput(false)}
-                  <ImageIcon className="w-5 h-5" />
+                <button
+                  onClick={reset}
+                  className="hidden lg:flex btn-primary btn-wide w-fit mt-10"
+                >
                   Analyze another leaf
-                </label>
+                </button>
               </div>
             )}
           </section>
@@ -728,7 +796,7 @@ export default function Home() {
                 {loading ? (
                   <>
                     <Loader2 className="w-5 h-5 animate-spin" />
-                    Analyzing
+                    {loadingLabel}
                   </>
                 ) : (
                   "Analyze leaf"
@@ -744,11 +812,9 @@ export default function Home() {
               </button>
             </>
           ) : (
-            <label className="btn-primary flex-1">
-              {fileInput(true)}
-              <Camera className="w-5 h-5" />
+            <button onClick={reset} className="btn-primary flex-1">
               Analyze another leaf
-            </label>
+            </button>
           )}
         </footer>
       </div>
